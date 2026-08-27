@@ -4,7 +4,7 @@ import { SetPasswordModal } from "./modal/SetPasswordModal";
 import { ManageHiddenPaths } from "settings/ManageHiddenPaths";
 import { ChangePasswordSetting } from "settings/ChangePasswordSetting";
 import { ShowHiddenFilesSetting } from "settings/ShowHiddenFilesSetting";
-import { changePathVisibility } from 'utils';
+import { changePathVisibility, remapHiddenPath } from 'utils';
 
 interface PasswordPluginSettings {
 	hidden: boolean;
@@ -30,7 +30,7 @@ export default class PasswordPlugin extends Plugin {
 			id: "all-hidden-files-to-md",
 			name: "Turn all hidden files to Markdown",
 			callback: () => {
-				new ProtectedPathsModal(this.app, (result) => {
+				new ProtectedPathsModal(this.app, async (result) => {
 					if (result == this.settings.password) {
 						//This method checks for every file in vault
 						for (const file of this.app.vault.getFiles()) {
@@ -39,7 +39,7 @@ export default class PasswordPlugin extends Plugin {
 								//Null Check
 								if (absFile instanceof TFile) {
 									const newPath = file.path.slice(0, file.path.length - this.EXT.length - 1) + ".md";
-									this.app.vault.rename(absFile, newPath);
+									await this.app.vault.rename(absFile, newPath);
 								}
 							}
 						}
@@ -90,6 +90,22 @@ export default class PasswordPlugin extends Plugin {
 			})
 		)
 
+		//Keep the hidden list pointing at the file after it is moved or renamed
+		this.registerEvent(
+			this.app.vault.on(`rename`, (file, oldPath) => {
+				let changed = false;
+				for (let i = 0; i < this.settings.hiddenList.length; i++) {
+					if (!this.settings.hiddenList[i]) continue;
+					const remapped = remapHiddenPath(this.settings.hiddenList[i], oldPath, file.path, this.EXT);
+					if (remapped != this.settings.hiddenList[i]) {
+						this.settings.hiddenList[i] = remapped;
+						changed = true;
+					}
+				}
+				if (changed) this.saveSettings();
+			})
+		)
+
 		//On active leaf change check if the file should be visible and close it if it shouldnt be
 		//I don't know how it affects performance
 		this.registerEvent(
@@ -137,7 +153,8 @@ export default class PasswordPlugin extends Plugin {
 		{
 			//Sets an event for when the file explorer changes/renders then hides files and then destroys the event
 			setTimeout(() => {
-				const view = this.app.workspace.getLeavesOfType("file-explorer")[0].view;
+				const explorerLeaf = this.app.workspace.getLeavesOfType("file-explorer")[0];
+				const view = explorerLeaf ? explorerLeaf.view : null;
 
 				const observer = new MutationObserver(() => {
 					if (this.settings.hidden == false)
@@ -180,13 +197,14 @@ export default class PasswordPlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
-	changeFileVisibility(hide: boolean) {
+	async changeFileVisibility(hide: boolean) {
 		// for (const path of this.settings.hiddenList) {
 		// 	changePathVisibility(path, hide);
 		// }
 		this.settings.hidden = hide;
 
 		if (hide) {
+			const unprotected: string[] = [];
 			for (let i = 0; i < this.settings.hiddenList.length; i++) {
 				const file = this.settings.hiddenList[i];
 				if (file) {
@@ -194,20 +212,32 @@ export default class PasswordPlugin extends Plugin {
 					if (absFile instanceof TFile) {
 						if (absFile.extension == "md") {
 							const newPath = file.slice(0,file.length - 3) + "." + this.EXT;
-							this.app.vault.rename(absFile, newPath);
+							await this.app.vault.rename(absFile, newPath);
+						}
+						//The entry followed the file into an extension the plugin cannot swap
+						else {
+							unprotected.push(file);
 						}
 					}
 					else if (absFile instanceof TFolder) {
 						changePathVisibility(file, hide);
-						for (const childFile of absFile.children) {
-							this.changeIndVis(childFile.path, hide);
+						for (const childFile of [...absFile.children]) {
+							await this.changeIndVis(childFile.path, hide);
 						}
 					}
+					//Neither the visible file nor its already hidden counterpart exists, so this entry protects nothing
+					else if (!this.app.vault.getAbstractFileByPath(file.slice(0, file.length - 3) + "." + this.EXT)) {
+						unprotected.push(file);
+					}
 				}
+			}
+			if (unprotected.length > 0) {
+				new Notice("Password Protect: not hiding " + unprotected.join(", ") + " - the path is gone or is no longer a markdown note.");
 			}
 		}
 		else {
 			for (const path of this.settings.hiddenList) {
+				if (!path) continue;
 				//Get the file with .pp extension
 				const file = this.app.vault.getAbstractFileByPath(path);
 				const ppPath = path.slice(0, path.length - 3) + "." + this.EXT;
@@ -215,14 +245,14 @@ export default class PasswordPlugin extends Plugin {
 				//If its a file replace the extension with .md
 				if (ppFile instanceof TFile) {
 					const newPath = ppFile.path.slice(0, ppFile.path.length - this.EXT.length - 1) + ".md";
-					this.app.vault.rename(ppFile, newPath);
+					await this.app.vault.rename(ppFile, newPath);
 				} 
 				else if (file instanceof TFolder) {
 					changePathVisibility(path, false);
 					//For every note in the folder
-					for (const childFile of file.children) {
+					for (const childFile of [...file.children]) {
 						//Replace the extension with .md
-						this.changeIndVis(childFile.path, hide);
+						await this.changeIndVis(childFile.path, hide);
 					}
 				}
 			}
@@ -288,20 +318,20 @@ export default class PasswordPlugin extends Plugin {
 			}
 		}
 	}
-	changeIndVis (path: string, hide: boolean) {
+	async changeIndVis (path: string, hide: boolean) {
 		if (hide) {
 			const absFile = this.app.vault.getAbstractFileByPath(path);
 			if (absFile instanceof TFile) {
 				if (absFile.extension == "md") {
 					const newPath = path.slice(0, path.length - 3) + "." + this.EXT;
-					this.app.vault.rename(absFile, newPath);
+					await this.app.vault.rename(absFile, newPath);
 				}
 			}
 			else if (absFile instanceof TFolder) {
 				changePathVisibility(path, hide);
-				for (const childFile of absFile.children) {
+				for (const childFile of [...absFile.children]) {
 					if (childFile instanceof TFile) {
-						this.changeIndVis(childFile.path, hide);
+						await this.changeIndVis(childFile.path, hide);
 					}
 				}
 			}
@@ -318,19 +348,25 @@ export default class PasswordPlugin extends Plugin {
 					if (file.extension == this.EXT) {
 						//Replace the .pp extension with .md
 						const newPath = file.path.slice(0,file.path.length - this.EXT.length - 1) + ".md";
-						this.app.vault.rename(file, newPath);
+						await this.app.vault.rename(file, newPath);
 					}
 				}
 			} else if (absFile instanceof TFolder) {
 				changePathVisibility(path, hide);
-				for (const childFile of absFile.children) {
-					this.changeIndVis(childFile.path, hide);
+				for (const childFile of [...absFile.children]) {
+					await this.changeIndVis(childFile.path, hide);
 				}
 			}
 		}
 	}
-	changeIndVisAndSave (path: string, hide: boolean) {
+	async changeIndVisAndSave (path: string, hide: boolean) {
 		if (hide) {
+			const target = this.app.vault.getAbstractFileByPath(path);
+			//Hiding works by swapping the extension, so anything that is not a note would get a broken path
+			if (target instanceof TFile && target.extension != "md") {
+				new Notice("Password Protect: only markdown notes can be hidden.");
+				return;
+			}
 			this.settings.hiddenList.push(path);
 		}
 		else {
@@ -343,13 +379,13 @@ export default class PasswordPlugin extends Plugin {
 			const absFile = this.app.vault.getAbstractFileByPath(path);
 			if (absFile instanceof TFile) {
 				const newPath = path.slice(0, path.length - 3) + "." + this.EXT;
-				this.app.vault.rename(absFile, newPath);
+				await this.app.vault.rename(absFile, newPath);
 			}
 			else if (absFile instanceof TFolder) {
 				changePathVisibility(path, hide);
-				for (const childFile of absFile.children) {
+				for (const childFile of [...absFile.children]) {
 					if (childFile instanceof TFile) {
-						this.changeIndVis(childFile.path, hide);
+						await this.changeIndVis(childFile.path, hide);
 					}
 				}
 			}
@@ -366,18 +402,18 @@ export default class PasswordPlugin extends Plugin {
 					if (file.extension == this.EXT) {
 						//Replace the .pp extension with .md
 						const newPath = file.path.slice(0, file.path.length - this.EXT.length - 1) + ".md";
-						this.app.vault.rename(file, newPath);
+						await this.app.vault.rename(file, newPath);
 					}
 				}
 			} else if (absFile instanceof TFolder) {
 				changePathVisibility(path, hide);
-				for (const childFile of absFile.children) {
-					this.changeIndVis(childFile.path, hide);
+				for (const childFile of [...absFile.children]) {
+					await this.changeIndVis(childFile.path, hide);
 				}
 			}
 		}
 	}
-	checkFolderForVisibility (path: string) {
+	async checkFolderForVisibility (path: string) {
 		if (!this.settings.hidden) return;
 		
 		const absFile = this.app.vault.getAbstractFileByPath(path);
@@ -389,8 +425,8 @@ export default class PasswordPlugin extends Plugin {
 					
 					changePathVisibility(file.path, true);
 					console.log("Making - " + file.path + " - hidden!");
-					for (const childFile of file.children) {
-						this.changeIndVis(childFile.path, true);
+					for (const childFile of [...file.children]) {
+						await this.changeIndVis(childFile.path, true);
 						console.log(childFile.name + " is hidden!");
 					}
 				}
